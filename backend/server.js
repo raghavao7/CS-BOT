@@ -9,7 +9,7 @@ import { createClient } from "redis";
 import http from "http";
 import { Server as SocketIOServer } from "socket.io";
 import { checkFaq } from "./faqService.js";
-import { buildMemoryReply } from "./formatCaseMemory.js";
+import { buildMemoryReply, buildAutoResolutionReply } from "./formatCaseMemory.js";
 
 import {
   searchSimilarCases,
@@ -45,16 +45,72 @@ app.use(
 );
 
 /* ------------------------------- Redis ----------------------------------- */
-const redisClient = createClient({
-  url: process.env.REDIS_URL || "redis://localhost:6379",
+const redisUrl = process.env.REDIS_URL || "redis://localhost:6379";
+let redisClient = createClient({
+  url: redisUrl,
   socket: {
     reconnectStrategy: (retries) => Math.min(retries * 50, 1000),
     tls: process.env.REDIS_USE_TLS === "true" ? {} : false,
   },
   password: process.env.REDIS_PASSWORD,
 });
+
 redisClient.on("error", (err) => console.error("Redis Error:", err));
-await redisClient.connect();
+
+let redisAvailable = false;
+class RedisFallback {
+  constructor() {
+    this.store = new Map();
+  }
+  async get(key) {
+    const v = this.store.get(key);
+    return v === undefined ? null : v;
+  }
+  async set(key, value, opts) {
+    this.store.set(key, String(value));
+    return 'OK';
+  }
+  async del(key) {
+    return this.store.delete(key) ? 1 : 0;
+  }
+  async keys(pattern = '*') {
+    return Array.from(this.store.keys());
+  }
+  async type(key) {
+    if (!this.store.has(key)) return 'none';
+    const v = this.store.get(key);
+    try {
+      JSON.parse(v);
+      return 'list';
+    } catch (e) {
+      return 'string';
+    }
+  }
+  async lRange(key, start, end) {
+    const v = this.store.get(key);
+    if (!v) return [];
+    try {
+      const arr = JSON.parse(v);
+      return Array.isArray(arr) ? arr.slice(start, end + 1) : [];
+    } catch (e) {
+      return [];
+    }
+  }
+  async quit() {
+    return;
+  }
+}
+
+// Try to connect; if it fails, fall back to in-memory store to keep the app running.
+try {
+  await redisClient.connect();
+  redisAvailable = true;
+  console.log('Connected to Redis at', redisUrl);
+} catch (err) {
+  console.error('Redis connection failed — falling back to in-memory store. Error:', err.message || err);
+  redisClient = new RedisFallback();
+  redisAvailable = false;
+}
 
 /* -------- Agent-only lock helpers (per case) -------- */
 const AGENT_ONLY_TTL = 30 * 60; // 30 minutes
@@ -73,11 +129,11 @@ async function clearAgentOnly(caseId) {
 
 /* ----------------------------- Gemini Models ----------------------------- */
 const GEMINI_MODELS = [
-  "gemini-2.0-flash",
-  "gemini-2.5-pro",
   "gemini-2.5-flash",
   "gemini-2.5-flash-lite",
+  "gemini-2.5-pro",
   "gemini-2.0-flash-lite",
+  "gemini-2.0-flash",
 ];
 
 async function callGemini(prompt) {
@@ -611,16 +667,32 @@ app.put("/api/case/:id", authMiddleware, async (req, res) => {
       const lastMsgs = Array.isArray(updatedCase.responses)
         ? updatedCase.responses.slice(-6)
         : [];
-      const summaryText =
-        "Resolution Summary: " +
-        lastMsgs
-          .map((r) =>
-            r.adminId ? `Agent: ${r.message}` : `User/Bot: ${r.message}`
-          )
-          .join(" | ")
-          .slice(0, 480);
+      const agentText = lastMsgs.filter((r) => r.adminId).map((r) => r.message).join(" ");
+      const transcriptSnippet = lastMsgs
+        .map((r) => (r.adminId ? `Agent: ${r.message}` : `User: ${r.message}`))
+        .join(" | ")
+        .slice(0, 400);
+
+      // Extract what action was taken
+      let resolutionAction = "other";
+      if (/refund/i.test(agentText)) resolutionAction = "refund";
+      else if (/replace|replacement|new unit|dispatch/i.test(agentText)) resolutionAction = "replacement";
+      else if (/resend|re-send|send again/i.test(agentText)) resolutionAction = "resend";
+      else if (/explain|information|clarif/i.test(agentText)) resolutionAction = "explanation";
+
+      // Use Gemini to write a clean 1-2 sentence summary of problem + resolution
+      let summaryText = `Problem: ${updatedCase.description || ""}. Resolution: ${transcriptSnippet}`;
       try {
-        await indexResolutionSummary(updatedCase, summaryText);
+        const gs = await callGemini(
+          `Summarize this customer support case in 1-2 sentences. Problem: "${updatedCase.description}". Agent resolution: "${transcriptSnippet}". Focus on what the issue was and how it was resolved. Plain text only.`
+        );
+        if (gs) summaryText = gs;
+      } catch (e) {
+        console.warn("Gemini summary skipped:", e?.message);
+      }
+
+      try {
+        await indexResolutionSummary(updatedCase, summaryText, resolutionAction);
       } catch (e) {
         console.warn("Failed to index resolution summary:", e?.message || e);
       }
@@ -932,63 +1004,73 @@ app.post("/api/chat", authMiddleware, async (req, res) => {
       return res.json({ reply, source: "faq", score: faqHit.score });
     }
 
-    // // CaseMemory
-const K = Number(process.env.SIM_TOP_K ?? 3);
-const CM_TH = Number(process.env.SIM_CASE_THRESHOLD ?? 0.72);
-const similar = await searchSimilarCases(message, domain, K);
-if (similar?.length && similar[0].score >= CM_TH) {
-  const top = similar[0];
+    // CaseMemory — search only resolved cases
+    const K = Number(process.env.SIM_TOP_K ?? 3);
+    const CM_TH = Number(process.env.SIM_CASE_THRESHOLD ?? 0.68);
+    const AUTO_TH = Number(process.env.SIM_AUTO_RESOLVE_THRESHOLD ?? 0.82);
+    const similar = await searchSimilarCases(message, domain, K);
+    if (similar?.length && similar[0].score >= CM_TH) {
+      const top = similar[0];
+      const isAutoResolve =
+        top.isResolved &&
+        top.resolutionAction &&
+        top.resolutionAction !== "other" &&
+        top.score >= AUTO_TH;
 
-  // ✨ Clean + format the memory into a nice sentence
-  const pretty = buildMemoryReply(top.summary, {
-    orderId,
-    productName: selectedProduct?.name,
-    // missingQty: set if you track this (optional)
-  });
+      const reply = isAutoResolve
+        ? buildAutoResolutionReply(top, { orderId, productName: selectedProduct?.name })
+        : buildMemoryReply(top.problemSummary || top.summary || "", {
+            orderId,
+            productName: selectedProduct?.name,
+          });
 
-  await redisClient.rPush(
-    chatKey,
-    JSON.stringify({
-      prompt: message,
-      reply: pretty,
-      orderId,
-      productIndex,
-      caseId: top.caseId,
-      timestamp: Date.now(),
-      source: "case-memory",
-      score: top.score,
-    })
-  );
-  await redisClient.expire(chatKey, 86400);
+      // Create/update the case record
+      let memCase = await Case.findOne({ userId, orderId, productIndex });
+      if (!memCase) {
+        memCase = await new Case({
+          userId, orderId, productIndex,
+          description: message,
+          priority: "low", domain,
+          status: isAutoResolve ? "resolved" : "open",
+        }).save();
+      } else if (isAutoResolve && memCase.status !== "resolved") {
+        memCase.status = "resolved";
+        await memCase.save();
+      }
 
-  io.to(`user:${userId}`).emit("chat:reply", {
-    userId,
-    orderId,
-    productIndex,
-    caseId: top.caseId,
-    source: "case-memory",
-    message: pretty,
-    timestamp: Date.now(),
-  });
+      await redisClient.rPush(
+        chatKey,
+        JSON.stringify({
+          prompt: message, reply, orderId, productIndex,
+          caseId: memCase._id,
+          timestamp: Date.now(),
+          source: isAutoResolve ? "auto-resolved" : "case-memory",
+          score: top.score,
+        })
+      );
+      await redisClient.expire(chatKey, 86400);
 
-  // mirror to agents dashboards
-  io.to("agents").emit("chat:reply", {
-    userId,
-    orderId,
-    productIndex,
-    caseId: top.caseId,
-    source: "case-memory",
-    message: pretty,
-    timestamp: Date.now(),
-  });
+      io.to(`user:${userId}`).emit("chat:reply", {
+        userId, orderId, productIndex,
+        caseId: memCase._id,
+        source: isAutoResolve ? "auto-resolved" : "case-memory",
+        message: reply, timestamp: Date.now(),
+      });
+      io.to("agents").emit("chat:reply", {
+        userId, orderId, productIndex,
+        caseId: memCase._id,
+        source: isAutoResolve ? "auto-resolved" : "case-memory",
+        message: reply, timestamp: Date.now(),
+      });
 
-  return res.json({
-    reply: pretty,
-    source: "case-memory",
-    score: top.score,
-    similarCases: similar.map((s) => ({ caseId: s.caseId, score: s.score })),
-  });
-}
+      return res.json({
+        reply,
+        source: isAutoResolve ? "auto-resolved" : "case-memory",
+        score: top.score,
+        routed: isAutoResolve ? "auto" : "suggest",
+        similarCases: similar.map((s) => ({ caseId: s.caseId, score: s.score })),
+      });
+    }
 
 
     // LLM

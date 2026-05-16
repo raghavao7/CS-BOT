@@ -21,7 +21,7 @@ export const Faq = mongoose.models.Faq || mongoose.model("Faq", faqSchema);
 export async function getEmbedding(text) {
   try {
     const r = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${process.env.GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key=${process.env.GEMINI_API_KEY}`,
       { content: { parts: [{ text }] } },
       { headers: { "Content-Type": "application/json" } }
     );
